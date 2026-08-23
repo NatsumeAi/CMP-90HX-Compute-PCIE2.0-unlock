@@ -1,0 +1,15 @@
+*.ko
+*.o
+*.mod.c
+bar0rw
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+*.pem
+id_rsa
+id_ed25519
+*credentials*
+*secret*
+.ssh/

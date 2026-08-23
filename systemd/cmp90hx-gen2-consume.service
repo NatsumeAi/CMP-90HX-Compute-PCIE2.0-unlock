@@ -1,0 +1,14 @@
+[Unit]
+Description=CMP 90HX Gen2 privilege-mask consume (once per cold boot, several minutes)
+After=local-fs.target
+Before=cmp90hx-gen2-hammer.service
+ConditionPathExists=/usr/local/sbin/cmp90hx-gen2-consume.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cmp90hx-gen2-consume.sh
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

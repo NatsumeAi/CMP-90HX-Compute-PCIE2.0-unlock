@@ -1,0 +1,881 @@
+CMP 90HX VBIOS 94.02.74.00.07 PCIe Gen2, on top of pearlfortune rejoin15 + jdowning100 rejoin16.
+
+Do not write config-space LnkCap. TLS is CAP_EXP+30. Retrain-Link only.
+
+diff -Naur a/kernel-open/common/inc/nv-proto.h b/kernel-open/common/inc/nv-proto.h
+--- a/kernel-open/common/inc/nv-proto.h
++++ b/kernel-open/common/inc/nv-proto.h
+@@ -105,4 +105,5 @@
+ 
+ int           nv_start_device(nv_state_t *nv, nvidia_stack_t *sp);
+ void          nv_stop_device(nv_state_t *nv, nvidia_stack_t *sp);
++void          nv_cmp90hx_gen2_cancel(void);
+ #endif /* _NV_PROTO_H_ */
+diff -Naur a/kernel-open/nvidia/nv.c b/kernel-open/nvidia/nv.c
+--- a/kernel-open/nvidia/nv.c
++++ b/kernel-open/nvidia/nv.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <linux/module.h>  // for MODULE_FIRMWARE
++#include <linux/fs.h>      // filp_open / kernel_read for cmp90_gen2_idx
+ 
+ // must precede "nv.h" and "nv-firmware.h" includes
+ #define NV_FIRMWARE_FOR_NAME(name)  "nvidia/" NV_VERSION_STRING "/" name ".bin"
+@@ -56,6 +57,39 @@
+ #include "nv-caps-imex.h"
+ 
+ /*
++ * Per-load CMP90 Gen2 mask-table index. Userspace writes
++ * /var/lib/cmpunlocker-rs/gen2-idx before insmod (udev-safe) or passes
++ * cmp90_gen2_idx=N. The BSS index inside RM cannot survive rmmod.
++ */
++unsigned int nv_cmp90_gen2_idx;
++module_param_named(cmp90_gen2_idx, nv_cmp90_gen2_idx, uint, 0444);
++MODULE_PARM_DESC(cmp90_gen2_idx,
++    "CMP 90HX Gen2 privilege-mask table index for this module load");
++
++static void nv_cmp90_load_gen2_idx(void)
++{
++    struct file *f;
++    char buf[32];
++    loff_t pos = 0;
++    ssize_t n;
++
++    f = filp_open("/var/lib/cmpunlocker-rs/gen2-idx", O_RDONLY, 0);
++    if (IS_ERR(f))
++        return;
++    n = kernel_read(f, buf, sizeof(buf) - 1, &pos);
++    filp_close(f, NULL);
++    if (n <= 0)
++        return;
++    buf[n] = '\0';
++    if (kstrtouint(buf, 0, &nv_cmp90_gen2_idx) == 0)
++    {
++        nv_printf(NV_DBG_ERRORS,
++                  "NVRM: cmp90_gen2_idx=%u (from gen2-idx file)\n",
++                  nv_cmp90_gen2_idx);
++    }
++}
++
++/*
+  * Commit aefb2f2e619b ("x86/bugs: Rename CONFIG_RETPOLINE =>
+  * CONFIG_MITIGATION_RETPOLINE) in v6.8 renamed CONFIG_RETPOLINE.
+  */
+@@ -70,112 +104,181 @@
+ #include <uapi/linux/pci_regs.h>
+ 
+ /*
+- * CMP90_STOCKFLOW_REJOIN16: apply the PCIe Gen2 speed-path configuration and
+- * retrain the link, from the driver, right after nv_start_device() completes.
+- * At this point GSP-RM has finished its init-time link setup (it reverts
+- * userspace writes to PRIV_MISC_1/LINK_CONFIG_0 during init), the PCIe
+- * privilege masks are open, and no user traffic is running yet. Userspace
+- * pokes of LINK_CONFIG_0 outside this window intermittently wedge the XVE
+- * block; in-kernel at this point mirrors the GA100 cmpunlocker's approach.
++ * 50HX + 170HX Gen2 sequence, as verified on those cards:
++ *   170HX: program speed path after Booter / before GSP-RM (late-config
++ *           in kernel_gsp_booter_tu102.c). Userspace hammer does RL.
++ *   50HX:  after nv_start_device, write LTSSM, set TLS, one Retrain-Link,
++ *           poll. Never LnkCap, never Link Disable.
++ * 90HX extra vs 50HX: GSP init overwrites LINK_CONFIG/PRIV_MISC/PL_RATE,
++ * so this function writes those once (jdowning100) then retrains like 50HX.
++ * No lifetime rewrite loop — that is not part of 50HX/170HX.
+  */
++#define CMP90_GEN2_PL_RATE_SPEED_MASK   0x00060000U
++#define CMP90_GEN2_PL_RATE_GEN2         0x00040000U
++#define CMP90_ECC_PLM                   0x00823800U
++#define CMP90_ECC_PLM_LOCKED            0xffffff8fU
++
++static NvBool
++nv_cmp90hx_is_target(struct pci_dev *gpu)
++{
++    return (gpu != NULL) &&
++           (gpu->device == 0x220d) &&
++           (gpu->subsystem_vendor == 0x10de) &&
++           (gpu->subsystem_device == 0x1555);
++}
++
++static NvBool
++nv_cmp90hx_ecc_more_open(u32 v)
++{
++    return ((v & CMP90_ECC_PLM_LOCKED) == CMP90_ECC_PLM_LOCKED) &&
++           (v != CMP90_ECC_PLM_LOCKED);
++}
++
++static int
++nv_cmp90hx_gen2_set_tls(nv_state_t *nv, NvBool do_rl)
++{
++    nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
++    struct pci_dev *gpu = nvl->pci_dev;
++    struct pci_dev *upstream;
++    u16 gpu_ctl2, upstream_ctl2, upstream_ctl;
++    int ret;
++
++    if (!nv_cmp90hx_is_target(gpu))
++        return -ENODEV;
++    upstream = pci_upstream_bridge(gpu);
++    if (upstream == NULL)
++        return -ENODEV;
++
++    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
++    if (ret)
++        return ret;
++    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2, &upstream_ctl2);
++    if (ret)
++        return ret;
++    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
++    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
++                    PCI_EXP_LNKCTL2_TLS_5_0GT;
++    ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
++    if (ret)
++        return ret;
++    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL2, upstream_ctl2);
++    if (ret)
++        return ret;
++    if (!do_rl)
++        return 0;
++    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL, &upstream_ctl);
++    if (ret)
++        return ret;
++    return pcie_capability_write_word(upstream, PCI_EXP_LNKCTL,
++                                      (upstream_ctl | PCI_EXP_LNKCTL_RL) &
++                                      ~PCI_EXP_LNKCTL_LD);
++}
++
++void
++nv_cmp90hx_gen2_cancel(void)
++{
++}
++
+ static void
+ nv_cmp90hx_gen2_config(nv_state_t *nv)
+ {
+     nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+     struct pci_dev *gpu = nvl->pci_dev;
+-    struct pci_dev *upstream;
+     void __iomem *bar0;
+-    u16 gpu_ctl2, upstream_ctl2, upstream_ctl, link_status = 0;
+-    u32 val;
+-    int ret, attempt;
++    u32 ecc, cfg, pl, misc, cya0;
++    u16 sta = 0;
++    int attempt;
++    int ret;
+ 
+-    if ((gpu == NULL) || (gpu->device != 0x220d) ||
+-        (gpu->subsystem_vendor != 0x10de) || (gpu->subsystem_device != 0x1555))
++    if (!nv_cmp90hx_is_target(gpu))
+         return;
+-
+-    upstream = pci_upstream_bridge(gpu);
+-    if (upstream == NULL)
++    if (pci_upstream_bridge(gpu) == NULL)
+     {
+         NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+-                      "CMP90 Gen2: no upstream PCIe bridge; skipping\n");
++                      "CMP90 Gen2: no upstream bridge; 50HX retrain skipped\n");
+         return;
+     }
+ 
+-    /* map the whole 16MB BAR0: the FEAT_OVR_ECC_PLM gate lives at 0x823800 */
+     bar0 = ioremap(pci_resource_start(gpu, 0), 0x1000000);
+     if (bar0 == NULL)
+     {
+         NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+-                      "CMP90 Gen2: cannot map BAR0; skipping\n");
++                      "CMP90 Gen2: BAR0 map failed; retrain skipped\n");
+         return;
+     }
+ 
+-    /* Only when ALL the PCIe privilege masks are open (rejoin16 crafted-
+-     * Booter writes; FEAT_OVR_ECC_PLM is the last one opened by the apply
+-     * script). Otherwise the speed path is locked and poking it is unsafe. */
+-    if (readl(bar0 + 0x823800) != 0xffffffffU)
++    ecc = readl(bar0 + CMP90_ECC_PLM);
++    if (!nv_cmp90hx_ecc_more_open(ecc))
+     {
++        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                      "CMP90 Gen2: skip, ECC_PLM=0x%08x\n", ecc);
+         iounmap(bar0);
+         return;
+     }
+ 
+-    val = readl(bar0 + 0x8841c);   /* PRIV_MISC_1: GEN2_EN set, VAL clear */
+-    writel((val | (1U << 11) | (1U << 13)) & ~((1U << 12) | (1U << 14)),
++    /* jdowning100: GSP init already reverted these; write once like 90HX port */
++    misc = readl(bar0 + 0x8841c);
++    writel((misc | (1U << 11) | (1U << 13)) & ~((1U << 12) | (1U << 14)),
+            bar0 + 0x8841c);
+-    writel(readl(bar0 + 0x8c2c0) & ~(1U << 2), bar0 + 0x8c2c0); /* CYA_0 */
+-    writel(0x00000000U, bar0 + 0x8e120);   /* XP3G_VAL0 */
+-    writel(0x00000001U, bar0 + 0x8e110);   /* XP3G_OVR0 */
+-    writel(0x00200000U, bar0 + 0x8e12c);   /* XP3G_VAL3 */
+-    writel(0x00000004U, bar0 + 0x8e11c);   /* XP3G_OVR3 */
+-    val = readl(bar0 + 0x8c040);           /* LINK_CONFIG_0 MAX_RATE=2 */
+-    writel((val & ~0x000c0000U) | (2U << 18), bar0 + 0x8c040);
+-    writel(0x00000006U, bar0 + 0x8872c);   /* XVE_LTSSM override */
++    cya0 = readl(bar0 + 0x8c2c0);
++    writel(cya0 & ~(1U << 2), bar0 + 0x8c2c0);
++    writel(0x00000000U, bar0 + 0x8e120);
++    writel(0x00000001U, bar0 + 0x8e110);
++    writel(0x00200000U, bar0 + 0x8e12c);
++    writel(0x00000004U, bar0 + 0x8e11c);
++    cfg = readl(bar0 + 0x8c040);
++    writel((cfg & ~0x000c0000U) | (2U << 18), bar0 + 0x8c040);
++    pl = readl(bar0 + 0x8c1c0);
++    writel((pl & ~CMP90_GEN2_PL_RATE_SPEED_MASK) | CMP90_GEN2_PL_RATE_GEN2,
++           bar0 + 0x8c1c0);
++
++    cya0 = readl(bar0 + 0x8c2c0);
++    cfg = readl(bar0 + 0x8c040);
++    pl = readl(bar0 + 0x8c1c0);
++    if (((cya0 & (1U << 2)) != 0U) ||
++        (((cfg >> 18) & 3U) != 2U) ||
++        ((pl & CMP90_GEN2_PL_RATE_SPEED_MASK) != CMP90_GEN2_PL_RATE_GEN2))
++    {
++        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                      "CMP90 Gen2: 50HX GSP policy missing CYA=%08x CFG=%08x "
++                      "PL=%08x; retrain skipped\n",
++                      cya0, cfg, pl);
++        iounmap(bar0);
++        return;
++    }
++
++    writel(6U, bar0 + 0x8872c);
+     (void)readl(bar0 + 0x8872c);
+     iounmap(bar0);
+     msleep(50);
+ 
+-    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
+-    if (ret)
+-        goto capability_error;
+-    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2, &upstream_ctl2);
+-    if (ret)
+-        goto capability_error;
+-    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
+-    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) | PCI_EXP_LNKCTL2_TLS_5_0GT;
+-    ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
+-    if (ret)
+-        goto capability_error;
+-    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL2, upstream_ctl2);
+-    if (ret)
+-        goto capability_error;
+-    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL, &upstream_ctl);
+-    if (ret)
+-        goto capability_error;
+-    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL,
+-                                     upstream_ctl | PCI_EXP_LNKCTL_RL);
++    ret = nv_cmp90hx_gen2_set_tls(nv, NV_TRUE);
+     if (ret)
+-        goto capability_error;
++    {
++        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                      "CMP90 Gen2: TLS/RL failed (%d)\n", ret);
++        return;
++    }
+ 
+     for (attempt = 0; attempt < 20; attempt++)
+     {
+         msleep(100);
+-        ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &link_status);
++        ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &sta);
+         if (!ret &&
+-            ((link_status & PCI_EXP_LNKSTA_CLS) >= PCI_EXP_LNKSTA_CLS_5_0GB))
++            ((sta & PCI_EXP_LNKSTA_CLS) >= PCI_EXP_LNKSTA_CLS_5_0GB))
+         {
+-            NV_DEV_PRINTF(NV_DBG_INFO, nv, "CMP90 Gen2: PCIe link trained to Gen%u\n",
+-                          link_status & PCI_EXP_LNKSTA_CLS);
++            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
++                          "CMP90 Gen2: 50HX RETRAIN_PASS status=%04x "
++                          "attempt=%d\n",
++                          sta, attempt + 1);
+             return;
+         }
+     }
+ 
+     NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+-                  "CMP90 Gen2: retrain completed without Gen2 link (status=0x%04x)\n",
+-                  link_status);
+-    return;
+-capability_error:
+-    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+-                  "CMP90 Gen2: PCIe capability access failed (%d); skipping\n", ret);
++                  "CMP90 Gen2: 50HX RETRAIN_FAIL status=%04x "
++                  "(170HX hammer still applies RL)\n",
++                  sta);
+ }
+ 
+ static DEFINE_MUTEX(cmp90_rejoin15_start_lock);
+@@ -963,6 +1066,7 @@
+     const NvBool is_nvswitch_present = os_is_nvswitch_present();
+     int num_pci_devices = 0, num_platform_devices = 0;
+ 
++    nv_cmp90_load_gen2_idx();
+     nv_memdbg_init();
+ 
+     rc = nv_procfs_init();
+@@ -1151,6 +1255,8 @@
+ {
+     nvidia_stack_t *sp = __nv_init_sp;
+ 
++    nv_cmp90hx_gen2_cancel();
++
+     nv_unregister_chrdev(NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE, 1,
+         &nv_linux_control_device_cdev);
+     nv_unregister_chrdev(0, NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1,
+@@ -1647,6 +1753,8 @@
+ 
+     nv->flags |= NV_FLAG_INITIALIZED;
+ 
++    nv_cmp90hx_gen2_config(nv);
++
+     rm_request_dnotifier_state(sp, nv);
+ 
+     /*
+diff -Naur a/kernel-open/nvidia/nv-pci.c b/kernel-open/nvidia/nv-pci.c
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -2417,6 +2417,8 @@
+ 
+     nv = NV_STATE_PTR(nvl);
+ 
++    nv_cmp90hx_gen2_cancel();
++
+ #if NV_IS_EXPORT_SYMBOL_GPL_iommu_dev_disable_feature
+ #if defined(CONFIG_IOMMU_SVA) && \
+     (defined(NV_IOASID_GET_PRESENT) || defined(NV_MM_PASID_DROP_PRESENT))
+diff -Naur a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_booter_tu102.c b/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_booter_tu102.c
+--- a/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_booter_tu102.c
++++ b/src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_booter_tu102.c
+@@ -62,6 +62,80 @@
+ static NvBool
+ s_cmp90PcStockRetryArmedByGpu[CMP90_PC_EXACT_MAX_GPU_INSTANCES];
+ 
++/*
++ * GEN2TABLE: compiled-in privilege-mask sequence for the PCIe Gen2 unlock.
++ * Replaces the userspace spec file (kernel-context os_open_and_read_file of
++ * /var/lib/cmpunlocker-rs/rejoin16-next-write.bin fails with 0x59 on this
++ * system even when the file exists). Sequence from
++ * jdowning100/cmpunlocker bench/rejoin16-apply-all.sh (validated on CMP 90HX
++ * GA102, cold-boot tested 2026-08-16). FEAT bootstrap excluded - handled by
++ * the boot-time unlock. One entry consumed per FLR-separated module load;
++ * the V67 chain fires exactly once per load.
++ */
++static const struct {
++    NvU32 addr;
++    NvU32 value;
++} s_cmp90Gen2MaskTable[] = {
++    { 0x00088fe8U, 0xffffffffU },
++    { 0x00088fecU, 0xffffffffU },
++    { 0x00088ff0U, 0xffffffffU },
++    { 0x00088ff4U, 0xffffffffU },
++    { 0x00088ff8U, 0xffffffffU },
++    { 0x00088ab4U, 0xffffffffU },
++    { 0x0008e1b0U, 0xffffffffU },
++    { 0x0008e1b4U, 0xffffffffU },
++    { 0x0008e1b8U, 0xffffffffU },
++    { 0x0008e1bcU, 0xffffffffU },
++    { 0x0008e1c0U, 0xffffffffU },
++    { 0x0008e1c4U, 0xffffffffU },
++    { 0x0008e1c8U, 0xffffffffU },
++    { 0x0008e1ccU, 0xffffffffU },
++    { 0x0008e1d0U, 0xffffffffU },
++    { 0x0008e1d4U, 0xffffffffU },
++    { 0x0008e1d8U, 0xffffffffU },
++    { 0x0008e1dcU, 0xffffffffU },
++    { 0x0008e1e0U, 0xffffffffU },
++    { 0x0008e1e4U, 0xffffffffU },
++    { 0x0008e1e8U, 0xffffffffU },
++    { 0x0008e1ecU, 0xffffffffU },
++    { 0x0008e1f0U, 0xffffffffU },
++    { 0x008200d0U, 0xffffffffU },
++    { 0x008200d4U, 0xffffffffU },
++    { 0x008200d8U, 0xffffffffU },
++    { 0x008200dcU, 0xffffffffU },
++    { 0x008200e0U, 0xffffffffU },
++    { 0x008200e4U, 0xffffffffU },
++    { 0x008200e8U, 0xffffffffU },
++    { 0x008200ecU, 0xffffffffU },
++    { 0x008200f0U, 0xffffffffU },
++    { 0x008200f4U, 0xffffffffU },
++    /* idx 33: FEAT_OVR_ECC_PLM — jdowning100's "all PCIe masks open" gate.
++     * Not GFX 0x823b04. Compute FEAT 0x823804 stays the bootstrap floor. */
++    { 0x00823800U, 0xffffffffU },
++};
++#define CMP90_GEN2_MASK_TABLE_SIZE \
++    (sizeof(s_cmp90Gen2MaskTable) / sizeof(s_cmp90Gen2MaskTable[0]))
++
++extern unsigned int nv_cmp90_gen2_idx;
++
++NvBool
++kgspCmp90Gen2Lookup(NvU32 idx, NvU32 *pAddr, NvU32 *pValue)
++{
++    if (idx >= CMP90_GEN2_MASK_TABLE_SIZE)
++        return NV_FALSE;
++    if (pAddr != NULL)
++        *pAddr = s_cmp90Gen2MaskTable[idx].addr;
++    if (pValue != NULL)
++        *pValue = s_cmp90Gen2MaskTable[idx].value;
++    return NV_TRUE;
++}
++
++NvU32
++kgspCmp90Gen2TableSize(void)
++{
++    return (NvU32)CMP90_GEN2_MASK_TABLE_SIZE;
++}
++
+ static NvU32
+ _kgspCmp90Rejoin14GpuSlot
+ (
+@@ -182,6 +256,8 @@
+     NvU32 tracePc = 0xffffffffU;
+     NvU32 featPlmBefore = 0xffffffffU;
+     NvU32 featPlmAfter = 0xffffffffU;
++    NvU32 eccPlmBefore = 0xffffffffU;
++    NvU32 eccPlmAfter = 0xffffffffU;
+     NvBool bCmp90PcStockRetry = NV_FALSE;
+     NvBool bCmp90PcCanary =
+         (((pGpu->idInfo.PCIDeviceID >> 16) ==
+@@ -250,6 +326,7 @@
+         s_cmp90PcExactTimingAttemptedByGpu[cmp90PcGpuSlot] = NV_TRUE;
+         featPlmBefore = GPU_REG_RD32(
+             pGpu, CMP90_PC_EXACT_FEAT_OVR_PLM);
++        eccPlmBefore = GPU_REG_RD32(pGpu, 0x00823800U);
+     }
+ 
+     NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon)));
+@@ -267,8 +344,45 @@
+                                         bCmp90PcCanary ? &tracePc : NULL);
+     if (bCmp90PcCanary)
+     {
++        NvU32 wrAddr = CMP90_PC_EXACT_FEAT_OVR_PLM;
++        NvU32 wrValue = CMP90_PC_EXACT_PLM_OPEN;
++        NvU32 tableAddr = 0;
++        NvU32 tableValue = 0;
++        NvU32 readBack = 0;
++        NvU32 pollIdx = 0;
++        NvBool bTableHit = kgspCmp90Gen2Lookup(nv_cmp90_gen2_idx,
++                                               &tableAddr, &tableValue);
++
+         featPlmAfter = GPU_REG_RD32(
+             pGpu, CMP90_PC_EXACT_FEAT_OVR_PLM);
++        if ((featPlmBefore == CMP90_PC_EXACT_PLM_OPEN) && bTableHit)
++        {
++            wrAddr = tableAddr;
++            wrValue = tableValue;
++        }
++        readBack = GPU_REG_RD32(pGpu, wrAddr);
++        for (pollIdx = 0;
++             (pollIdx < 1000) && (readBack != wrValue);
++             pollIdx++)
++        {
++            osDelay(1);
++            readBack = GPU_REG_RD32(pGpu, wrAddr);
++        }
++        NV_PRINTF(
++            LEVEL_ERROR,
++            "GEN2CHAIN: first-fire idx=%u addr=0x%08x want=0x%08x "
++            "readback=0x%08x polls=%u feat=0x%08x status=0x%x "
++            "mailbox0=0x%08x %s (same-load second exec is dead; "
++            "partial bits still count)\n",
++            nv_cmp90_gen2_idx, wrAddr, wrValue, readBack,
++            pollIdx, featPlmAfter, status, mailbox0Result,
++            (readBack == wrValue) ? "OK" : "PARTIAL");
++        eccPlmAfter = GPU_REG_RD32(pGpu, 0x00823800U);
++        NV_PRINTF(
++            LEVEL_ERROR,
++            "GEN2CHAIN: ECC_PLM(0x823800) before=0x%08x after=0x%08x "
++            "(lock=0xffffff8f; more-open counts, not full-F)\n",
++            eccPlmBefore, eccPlmAfter);
+         NV_PRINTF(
+             LEVEL_ERROR,
+             "CMP90_PROD_STACK_SHIFT_PLM_V67: native GA102 "
+@@ -289,165 +403,6 @@
+             (featPlmAfter == CMP90_PC_EXACT_PLM_OPEN) &&
+             !bCmp90PcStockRetry)
+         {
+-            /*
+-             * CMP90_STOCKFLOW_REJOIN16: one extra crafted Booter write per
+-             * module load. Measured on CMP 90HX: the GA102 V67 chain
+-             * re-fires only for the FIRST crafted execution that follows an
+-             * FWSEC (FRTS) run in a given boot cycle; later re-executions
+-             * never fire. A userspace driver therefore iterates the
+-             * register table across module reloads, passing one (addr,
+-             * value) pair per load in
+-             * /var/lib/cmpunlocker-rs/rejoin16-next-write.bin as 8 bytes
+-             * little-endian: addr (4) then value (4). Non-fatal throughout.
+-             */
+-            {
+-                NvU8 wrSpec[8 * 64];
+-                NvU32 cmp90PairIdx;
+-                NvU32 cmp90PairCount;
+-                NV_STATUS specStatus;
+-
+-                portMemSet(wrSpec, 0, sizeof(wrSpec));
+-                specStatus = os_open_and_read_file(
+-                    CMP90_REJOIN16_WRITE_SPEC_PATH, wrSpec, sizeof(wrSpec));
+-                if (specStatus != NV_OK)
+-                {
+-                    NV_PRINTF(LEVEL_ERROR,
+-                        "CMP90_STOCKFLOW_REJOIN16: no write spec at %s "
+-                        "(0x%x); no extra write this load\n",
+-                        CMP90_REJOIN16_WRITE_SPEC_PATH, specStatus);
+-                }
+-                else
+-                {
+-                    cmp90PairCount = sizeof(wrSpec) / 8;
+-                    for (cmp90PairIdx = 0;
+-                         cmp90PairIdx < cmp90PairCount;
+-                         cmp90PairIdx++)
+-                    {
+-                    NvU32 wrAddr = (NvU32)wrSpec[cmp90PairIdx * 8 + 0] |
+-                                   ((NvU32)wrSpec[cmp90PairIdx * 8 + 1] << 8) |
+-                                   ((NvU32)wrSpec[cmp90PairIdx * 8 + 2] << 16) |
+-                                   ((NvU32)wrSpec[cmp90PairIdx * 8 + 3] << 24);
+-                    NvU32 wrValue = (NvU32)wrSpec[cmp90PairIdx * 8 + 4] |
+-                                    ((NvU32)wrSpec[cmp90PairIdx * 8 + 5] << 8) |
+-                                    ((NvU32)wrSpec[cmp90PairIdx * 8 + 6] << 16) |
+-                                    ((NvU32)wrSpec[cmp90PairIdx * 8 + 7] << 24);
+-
+-                    if (wrAddr == 0)
+-                        break;
+-
+-                    if (GPU_REG_RD32(pGpu, wrAddr) == wrValue)
+-                    {
+-                        NV_PRINTF(LEVEL_ERROR,
+-                            "CMP90_STOCKFLOW_REJOIN16: pair %u addr=0x%08x "
+-                            "already open; skipping\n",
+-                            cmp90PairIdx, wrAddr);
+-                        continue;
+-                    }
+-
+-                    NvU32 wpr2LoSaved =
+-                        GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+-                    NvU32 wpr2HiSaved =
+-                        GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+-                    NvU32 readBack = 0;
+-                    NvU32 pollIdx = 0;
+-                    NV_STATUS wrStatus;
+-
+-                    NV_PRINTF(LEVEL_ERROR,
+-                        "CMP90_STOCKFLOW_REJOIN16: spec 0x%08x=0x%08x "
+-                        "wpr2_lo=0x%08x wpr2_hi=0x%08x\n",
+-                        wrAddr, wrValue, wpr2LoSaved, wpr2HiSaved);
+-
+-                    wrStatus = kgspCmp90V67RefillWrite(pGpu, pKernelGsp,
+-                                                       wrAddr, wrValue);
+-                    if (wrStatus != NV_OK)
+-                    {
+-                        NV_PRINTF(LEVEL_ERROR,
+-                            "CMP90_STOCKFLOW_REJOIN16: refill failed "
+-                            "status=0x%x; skipping extra write\n", wrStatus);
+-                    }
+-                    else
+-                    {
+-                        GPU_REG_WR32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO,
+-                                     wpr2LoSaved);
+-                        GPU_REG_WR32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI,
+-                                     wpr2HiSaved);
+-
+-                        /* CMP90_BATCH_TEST: FWSEC rerun skipped - frts_err=0xbe
+-                         * on replay suspected to block the crafted write;
+-                         * FRTS state from init-time run should persist. */
+-                        if (0 && pKernelGsp->pFwsecUcode != NULL &&
+-                            pKernelGsp->pWprMeta != NULL)
+-                        {
+-                            KernelGspPreparedFwsecCmd *pFwsecCmd =
+-                                portMemAllocNonPaged(
+-                                    sizeof(KernelGspPreparedFwsecCmd));
+-                            if (pFwsecCmd != NULL)
+-                            {
+-                                NV_STATUS fwsecStatus =
+-                                    kgspPrepareForFwsecFrts_HAL(pGpu,
+-                                        pKernelGsp, pKernelGsp->pFwsecUcode,
+-                                        pKernelGsp->pWprMeta->frtsOffset,
+-                                        pFwsecCmd);
+-                                if (fwsecStatus == NV_OK)
+-                                {
+-                                    kflcnReset_HAL(pGpu,
+-                                        staticCast(pKernelGsp, KernelFalcon));
+-                                    fwsecStatus = kgspExecuteFwsec_HAL(pGpu,
+-                                        pKernelGsp, pFwsecCmd);
+-                                }
+-                                portMemFree(pFwsecCmd);
+-                                NV_PRINTF(LEVEL_ERROR,
+-                                    "CMP90_STOCKFLOW_REJOIN16: fwsec "
+-                                    "status=0x%x\n", fwsecStatus);
+-                            }
+-                        }
+-
+-                        wrStatus = kflcnReset_HAL(pGpu,
+-                            staticCast(pKernelSec2, KernelFalcon));
+-                        if (wrStatus == NV_OK)
+-                        {
+-                            NvU32 wrMailbox0 = 0xffffffffU;
+-
+-                            wrStatus = s_executeBooterUcode_TU102(pGpu,
+-                                pKernelGsp, pKernelGsp->pBooterLoadUcode,
+-                                staticCast(pKernelSec2, KernelFalcon),
+-                                mailbox0, mailbox1,
+-                                &wrMailbox0, NULL, NULL, NULL, NULL, NULL);
+-
+-                            /*
+-                             * The chain fires asynchronously while the SEC2
+-                             * falcon keeps running after the early PLM
+-                             * handoff return (~150 ms at cold boot). Poll.
+-                             */
+-                            readBack = GPU_REG_RD32(pGpu, wrAddr);
+-                            for (pollIdx = 0;
+-                                 (pollIdx < 1000) && (readBack != wrValue);
+-                                 pollIdx++)
+-                            {
+-                                osDelay(1);
+-                                readBack = GPU_REG_RD32(pGpu, wrAddr);
+-                            }
+-
+-                            NV_PRINTF(LEVEL_ERROR,
+-                                "CMP90_STOCKFLOW_REJOIN16: write "
+-                                "0x%08x=0x%08x status=0x%x mailbox0=0x%08x "
+-                                "readback=0x%08x polls=%u %s\n",
+-                                wrAddr, wrValue, wrStatus, wrMailbox0,
+-                                readBack, pollIdx,
+-                                (readBack == wrValue) ? "OK" : "NO-EFFECT");
+-                        }
+-                        else
+-                        {
+-                            NV_PRINTF(LEVEL_ERROR,
+-                                "CMP90_STOCKFLOW_REJOIN16: falcon reset "
+-                                "failed status=0x%x\n", wrStatus);
+-                        }
+-                    }
+-                    }
+-                }
+-            }
+-
+-
+             NV_STATUS restoreStatus =
+                 kgspCmp90RestoreStockSignatureForBooter(pGpu, pKernelGsp);
+             NvU32 ss0Before;
+@@ -545,68 +500,66 @@
+     }
+ 
+     /*
+-     * CMP90_STOCKFLOW_REJOIN16 late Gen2 config: once the PCIe privilege
+-     * masks have been opened (XP3G_PLM reads fully open), program the Gen2
+-     * speed path right here - after the stock Booter Load, before GSP-RM
+-     * starts and begins actively managing the link. Userspace writes to
+-     * LINK_CONFIG_0 race GSP link management and intermittently wedge the
+-     * XVE block (card falls off the bus until platform reset); doing it at
+-     * this boot point mirrors where the GA100 cmpunlocker applies the same
+-     * registers on the 170HX.
++     * Late Gen2 config after Booter Load, before GSP-RM starts managing
++     * the link. Same gate as jdowning100: XP3G PLM already open. Do not
++     * wait for gen2-idx to pass the table size — on this card idx stays
++     * at 33 after the ECC fire, which previously skipped this write
++     * on every later load.
+      */
+     if ((status == NV_OK) && bCmp90PcCanary &&
+-        (GPU_REG_RD32(pGpu, 0x00823804U) == 0xffffffffU))
++        (GPU_REG_RD32(pGpu, 0x0008e1b0U) == 0xffffffffU))
+     {
+-        NvU32 vsec;
+-        NvU32 misc1;
+-        NvU32 cya0;
+-        NvU32 linkCfg;
+-
+-        /* 1. XVE 写保护解锁: VSEC_HIERARCHY bit12清/bit0置 + 8860c bit0 */
+-        vsec = GPU_REG_RD32(pGpu, 0x00088610U);
+-        GPU_REG_WR32(pGpu, 0x00088610U, (vsec & ~(1U << 12)) | (1U << 0));
++        NvU32 vsecBefore, vsecAfter;
++        NvU32 misc1Before, misc1After;
++        NvU32 cya0Before, cya0After;
++        NvU32 plRateBefore, plRateAfter;
++        NvU32 linkCfgBefore, linkCfgAfter;
++
++        vsecBefore = GPU_REG_RD32(pGpu, 0x00088610U);
++        GPU_REG_WR32(pGpu, 0x00088610U,
++                     (vsecBefore & ~(1U << 12)) | (1U << 0));
+         GPU_REG_WR32(pGpu, 0x0008860cU,
+                      GPU_REG_RD32(pGpu, 0x0008860cU) | (1U << 0));
++        vsecAfter = GPU_REG_RD32(pGpu, 0x00088610U);
+ 
+-        /* 2. 清熔丝阴影禁用锁 OPT_GEN23 */
+-        GPU_REG_WR32(pGpu, 0x0082057cU, 0x00000000U);
+-
+-        /* 3. PRIV_MISC1 GEN2_EN */
+-        misc1 = GPU_REG_RD32(pGpu, 0x0008841cU);
++        misc1Before = GPU_REG_RD32(pGpu, 0x0008841cU);
+         GPU_REG_WR32(pGpu, 0x0008841cU,
+-                     (misc1 | (1U << 11) | (1U << 13)) &
++                     (misc1Before | (1U << 11) | (1U << 13)) &
+                          ~((1U << 12) | (1U << 14)));
++        misc1After = GPU_REG_RD32(pGpu, 0x0008841cU);
+ 
+-        /* 4. CYA_0 清 DIS_G2 */
+-        cya0 = GPU_REG_RD32(pGpu, 0x0008c2c0U);
+-        GPU_REG_WR32(pGpu, 0x0008c2c0U, cya0 & ~(1U << 2));
+-
+-        /* 5. 广播 LINKCAP=Gen2 + PHY 时钟/速率程序 */
+-        GPU_REG_WR32(pGpu, 0x00088084U,
+-                     (GPU_REG_RD32(pGpu, 0x00088084U) & ~0xfU) | 0x2U);
+-        GPU_REG_WR32(pGpu, 0x0008c1c0U, 0x00240036U);
+-
+-        /* 6. XP3G 覆盖组 */
+-        GPU_REG_WR32(pGpu, 0x0008e120U, 0x00000000U);   /* XP3G_VAL0 */
+-        GPU_REG_WR32(pGpu, 0x0008e110U, 0x00000001U);   /* XP3G_OVR0 */
+-        GPU_REG_WR32(pGpu, 0x0008e12cU, 0x00200000U);   /* XP3G_VAL3 */
+-        GPU_REG_WR32(pGpu, 0x0008e11cU, 0x00000004U);   /* XP3G_OVR3 */
++        cya0Before = GPU_REG_RD32(pGpu, 0x0008c2c0U);
++        GPU_REG_WR32(pGpu, 0x0008c2c0U, cya0Before & ~(1U << 2));
++        cya0After = GPU_REG_RD32(pGpu, 0x0008c2c0U);
++
++        plRateBefore = GPU_REG_RD32(pGpu, 0x0008c1c0U);
++        GPU_REG_WR32(pGpu, 0x0008c1c0U, plRateBefore | (1U << 18));
++        plRateAfter = GPU_REG_RD32(pGpu, 0x0008c1c0U);
++
++        GPU_REG_WR32(pGpu, 0x0008e120U, 0x00000000U);
++        GPU_REG_WR32(pGpu, 0x0008e110U, 0x00000001U);
++        GPU_REG_WR32(pGpu, 0x0008e12cU, 0x00200000U);
++        GPU_REG_WR32(pGpu, 0x0008e11cU, 0x00000004U);
+ 
+-        /* 7. LINK_CONFIG_0 MAX_RATE=2 + XVE 目标速率=Gen2 */
+-        linkCfg = GPU_REG_RD32(pGpu, 0x0008c040U);
++        linkCfgBefore = GPU_REG_RD32(pGpu, 0x0008c040U);
+         GPU_REG_WR32(pGpu, 0x0008c040U,
+-                     (linkCfg & ~0x000C0000U) | (0x2U << 18));
+-        GPU_REG_WR32(pGpu, 0x000880a8U,
+-                     (GPU_REG_RD32(pGpu, 0x000880a8U) & ~0xfU) | 0x2U);
++                     (linkCfgBefore & ~0x000C0000U) | (0x2U << 18));
++        linkCfgAfter = GPU_REG_RD32(pGpu, 0x0008c040U);
+ 
+-        /* 8. LTSSM 重训脉冲 */
+         GPU_REG_WR32(pGpu, 0x0008872cU, 0x00000006U);
+ 
+         NV_PRINTF(LEVEL_ERROR,
+-                  "CMP90_STOCKFLOW_REJOIN16: Gen2 config applied! "
+-                  "LINKCAP=0x%08x OPT_GEN23=0x%08x\n",
+-                  GPU_REG_RD32(pGpu, 0x00088084U),
+-                  GPU_REG_RD32(pGpu, 0x0082057cU));
++                  "CMP90_GEN2CHAIN: late-config idx=%u "
++                  "VSEC 0x%08x->0x%08x MISC1 0x%08x->0x%08x "
++                  "CYA0 0x%08x->0x%08x PL_RATE 0x%08x->0x%08x "
++                  "LINK_CONFIG_0 0x%08x->0x%08x "
++                  "(skipped LnkCap/LnkCtl2/OPT_GEN23)\n",
++                  nv_cmp90_gen2_idx,
++                  vsecBefore, vsecAfter,
++                  misc1Before, misc1After,
++                  cya0Before, cya0After,
++                  plRateBefore, plRateAfter,
++                  linkCfgBefore, linkCfgAfter);
+     }
+ 
+     return status;
+diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -116,6 +116,10 @@
+ 
+ #define CMP90_PC_EXACT_MAX_GPU_INSTANCES        8U
+ 
++extern unsigned int nv_cmp90_gen2_idx;
++NvBool kgspCmp90Gen2Lookup(NvU32 idx, NvU32 *pAddr, NvU32 *pValue);
++NvU32 kgspCmp90Gen2TableSize(void);
++
+ static MEMORY_DESCRIPTOR *
+ s_cmp90PcStockSignatureMemdescByGpu[CMP90_PC_EXACT_MAX_GPU_INSTANCES];
+ static MEMORY_DESCRIPTOR *
+@@ -5858,10 +5862,16 @@
+ static void
+ _kgspCmp90FillV67Signature
+ (
++    OBJGPU *pGpu,
+     NvU8 *pSignatureVa
+ )
+ {
+     NvU64 i;
++    NvU32 writeAddr = CMP90_PC_EXACT_FEAT_OVR_PLM;
++    NvU32 writeValue = CMP90_PC_EXACT_PLM_OPEN;
++    NvU32 featPlm = GPU_REG_RD32(pGpu, CMP90_PC_EXACT_FEAT_OVR_PLM);
++    NvU32 tableAddr = 0;
++    NvU32 tableValue = 0;
+ 
+     for (i = 0;
+          i + sizeof(NvU32) <= CMP90_PC_EXACT_SIGNATURE_SIZE;
+@@ -5872,13 +5882,34 @@
+     }
+ 
+     /*
++     * One crafted BAR0 write per module load. Compute unlock is the floor:
++     * if FEAT is still locked, this fire writes FEAT regardless of idx.
++     * If FEAT is already open, the fire writes table[nv_cmp90_gen2_idx].
++     */
++    if ((featPlm == CMP90_PC_EXACT_PLM_OPEN) &&
++        kgspCmp90Gen2Lookup(nv_cmp90_gen2_idx, &tableAddr, &tableValue))
++    {
++        writeAddr = tableAddr;
++        writeValue = tableValue;
++    }
++
++    NV_PRINTF(
++        LEVEL_ERROR,
++        "CMP90_GEN2CHAIN: FillV67 idx=%u feat=0x%08x "
++        "f948=0x%08x f960=0x%08x ecc_plm=0x%08x%s\n",
++        nv_cmp90_gen2_idx, featPlm, writeValue, writeAddr,
++        GPU_REG_RD32(pGpu, 0x00823800U),
++        (writeAddr == CMP90_PC_EXACT_FEAT_OVR_PLM) ?
++            " (FEAT bootstrap)" : " (table)");
++
++    /*
+      * V67 uses the production-Booter stack map measured on CMP 90HX:
+      * active canary DMEM 0xff4c and initial return slot DMEM 0xff50.
+      */
+     _kgspCmp90PutU32(pSignatureVa, 0x1100, 0x00000007U);
+-    _kgspCmp90PutU32(pSignatureVa, 0xf948, 0xffffffffU);
++    _kgspCmp90PutU32(pSignatureVa, 0xf948, writeValue);
+     _kgspCmp90PutU32(pSignatureVa, 0xf950, 0x00000d44U);
+-    _kgspCmp90PutU32(pSignatureVa, 0xf960, 0x00823804U);
++    _kgspCmp90PutU32(pSignatureVa, 0xf960, writeAddr);
+     _kgspCmp90PutU32(pSignatureVa, 0xf968, 0x00001fceU);
+     _kgspCmp90PutU32(pSignatureVa, 0xf974, 0x00000000U);
+     _kgspCmp90PutU32(pSignatureVa, 0xf97c, 0x00001101U);
+@@ -5976,6 +6007,17 @@
+                 ss0, ss1, featPlm);
+             return NV_OK;
+         }
++
++        if ((featPlm == CMP90_PC_EXACT_PLM_OPEN) &&
++            (nv_cmp90_gen2_idx >= kgspCmp90Gen2TableSize()))
++        {
++            NV_PRINTF(
++                LEVEL_ERROR,
++                "CMP90_GEN2CHAIN: table complete (idx=%u size=%u); "
++                "keeping stock signature for late-config\n",
++                nv_cmp90_gen2_idx, kgspCmp90Gen2TableSize());
++            return NV_OK;
++        }
+     }
+ 
+     NV_CHECK_OR_RETURN(LEVEL_ERROR,
+@@ -6010,7 +6052,7 @@
+         (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+         fail_alloc);
+ 
+-    _kgspCmp90FillV67Signature(pSignatureVa);
++    _kgspCmp90FillV67Signature(pGpu, pSignatureVa);
+ 
+     memdescUnmapInternal(pGpu, pNewSignatureMemdesc, 0);
+     pSignatureVa = NULL;
+@@ -6026,8 +6068,9 @@
+     NV_PRINTF(
+         LEVEL_ERROR,
+         "CMP90_PROD_STACK_SHIFT_PLM_V67: replaced stock signature "
+-        "after GFW_BOOT with GA102 0xfa00 single-write chain for BAR0 "
+-        "0x00823804=0xffffffff old=%llu total=%llu CMP90_STOCKFLOW_REJOIN14\n",
++        "after GFW_BOOT with GA102 0xfa00 single-write chain "
++        "idx=%u old=%llu total=%llu CMP90_STOCKFLOW_REJOIN14\n",
++        nv_cmp90_gen2_idx,
+         (unsigned long long)oldSignatureSize,
+         (unsigned long long)CMP90_PC_EXACT_SIGNATURE_SIZE);
+ 

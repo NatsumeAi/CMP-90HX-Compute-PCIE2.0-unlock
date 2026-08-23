@@ -1,0 +1,14 @@
+[Unit]
+Description=CMP 90HX PCIe Gen2 retrain (170HX hammer: RL until Gen2, then exit)
+After=multi-user.target
+ConditionPathExists=/usr/local/sbin/cmp90hx-gen2-hammer.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CMP90_WAIT_GSP_S=90
+Environment=CMP90_HAMMER_LOG=/var/log/cmp90hx-gen2.log
+ExecStart=/usr/local/sbin/cmp90hx-gen2-hammer.sh
+
+[Install]
+WantedBy=multi-user.target
