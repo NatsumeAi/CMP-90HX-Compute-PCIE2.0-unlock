@@ -59,23 +59,26 @@ Do not write LnkCap. Do not use the 170HX `PL_LINK_RATE` value `0x00240036`. Lea
 
 ## Results
 
-Same card, tests left running under the **250 W** cap. Link stayed Gen 2. This board is **x4**.
+Same card. Each test ran long enough to sit on the **250 W** cap. Link stayed Gen 2. This board is **x4**. Memory clock stayed **9501 MHz**. PyTorch 2.9, CUDA 12.8, 8192³ except INT32. Locked FP32 on this card was about **0.72 TFLOPS**.
 
-| | |
-| --- | --- |
-| FP32 | 15.63 TFLOPS |
-| FP16 | 67.93 TFLOPS |
-| BF16 | 52.63 TFLOPS |
-| INT8 | 41.46 TOPS |
-| Host → GPU | 1.62 GB/s |
-| GPU → host | 1.70 GB/s |
+| Test | Time | Rate | SM | Power | PCIe |
+| --- | --- | --- | --- | --- | --- |
+| FP32 | 78 s | 15.63 TFLOPS | 1552 MHz (1515–1710) | 247 W | 5.0 GT/s |
+| TF32 | 38 s | 35.14 TFLOPS | 1486 MHz (1425–1875) | 247 W | 5.0 GT/s |
+| FP16 | 23 s | 67.93 TFLOPS | 1431 MHz (1380–1875) | 245 W | 5.0 GT/s |
+| BF16 | 27 s | 52.63 TFLOPS | 1542 MHz (1395–1875) | 246 W | 5.0 GT/s |
+| INT8 | 33 s | 41.46 TOPS | 1653 MHz (1620–1875) | 247 W | 5.0 GT/s |
+| INT32 | 5 s | 64.1 GOPS | 1826 MHz (1740–1860) | 237 W | 5.0 GT/s |
+| Host → GPU | 4 s | 1.62 GB/s | 1875 MHz | 131 W | 5.0 GT/s |
+| GPU → host | 4 s | 1.70 GB/s | 1875 MHz | 118 W | 5.0 GT/s |
+| On-GPU copy | 4 s | 351 GB/s | 1875 MHz | 205 W | 5.0 GT/s |
 
-Clocks and power: [RESULTS.md](RESULTS.md).
+Idle 91 W / 36°C. After the run 182 W / 53°C. Same table: [RESULTS.md](RESULTS.md).
 
 ## Notes
 
-This machine’s slot is physically x16, split to x8 in BIOS; the card still trained x4. Some 90HX already do x16. Two cards: same unlock on each.
-
-If BAR0 reads `0xffffffff`, cold reboot. Don’t toggle Link Disable with the driver loaded.
+- Slot is physically x16, BIOS split it to x8; this card still trained **x4**.
+- Some 90HX already do x16. Two cards: same unlock on each.
+- If BAR0 reads `0xffffffff`, cold reboot. Don’t toggle Link Disable with the driver loaded.
 
 [CREDITS.md](CREDITS.md) · [LICENSE](LICENSE)
